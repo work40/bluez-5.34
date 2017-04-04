@@ -32,6 +32,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+/* Patch for sonyps3remote - includes and defines */
+#include <sys/socket.h>
+#include <sys/un.h>
+#define EXTERNAL_HID_SOCKET_BASE "/var/run/bluez"
+/* End patch */
 
 #include "lib/bluetooth.h"
 #include "lib/hidp.h"
@@ -87,6 +92,9 @@ struct input_device {
 	uint8_t			report_req_pending;
 	guint			report_req_timer;
 	uint32_t		report_rsp_id;
+	/* Patch for sonyps3remote - io channel to external application */
+	GIOChannel              *external_io;
+	/* End patch */
 };
 
 static int idle_timeout = 0;
@@ -1002,6 +1010,9 @@ cleanup:
 
 static bool is_connected(struct input_device *idev)
 {
+	/* Patch for sonyps3remote - check connection state */
+	if (idev->external_io) return true;
+	/* End patch */
 	if (idev->uhid)
 		return (idev->intr_io != NULL && idev->ctrl_io != NULL);
 	else
@@ -1019,12 +1030,134 @@ static int connection_disconnect(struct input_device *idev, uint32_t flags)
 	if (idev->ctrl_io)
 		g_io_channel_shutdown(idev->ctrl_io, TRUE, NULL);
 
+	/* Patch for sonyps3remote - differentiated disconnect */
+	if (idev->external_io) {
+		info("Input: disconnect of externally handled input %s", idev->path);
+		g_io_channel_shutdown(idev->external_io, TRUE, NULL);
+		g_io_channel_unref(idev->external_io);
+		idev->external_io = NULL;
+		return 0;
+	}
+	/* End patch */
 	if (idev->uhid)
 		return 0;
 	else
 		return ioctl_disconnect(idev, flags);
 }
 
+/* Patch for sonyps3remote - subroutines */
+/* Event handler for externally handled input connections */
+static gboolean external_socket_event(GIOChannel *chan, GIOCondition cond, gpointer user_data) {
+	struct input_device *idev = user_data;
+	gchar buf[256];
+	gsize size;
+
+	/* We monitor the connection to the external application. If it is closed, we disconnect the remote */
+	if (cond & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
+		info("External application has closed the connection, disconnecting");
+		connection_disconnect(idev, 0);
+		return FALSE;
+	}
+
+	/* If data is available on the socket, we print it to the log */
+	if (cond & G_IO_IN) {
+		if (g_io_channel_read_chars(chan, buf, sizeof(buf) - 1, &size, NULL) !=
+				G_IO_STATUS_NORMAL) {
+			info("Cannot read from external application, shutting it down");
+			g_io_channel_shutdown(chan, TRUE, NULL);
+			return TRUE;
+		}
+		buf[size] = '\0';
+		info("Info from external application: %s", buf);
+	}
+	return TRUE;
+}
+
+/* Connect attempt routine for externally handled input connections */
+static gboolean input_device_try_external(struct input_device *idev) {
+
+	int s;
+	struct sockaddr_un remote;
+	struct msghdr msg;
+	struct cmsghdr *cmsg;
+	struct iovec iov;
+	int cmsgbuf[CMSG_SPACE(2 * sizeof(int))]; /* Control Message Buffer will fit two file descriptors */
+	int *fdptr;
+	char dst_addr[18];
+
+	/* Create a socket */
+	if ((s = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+		info("Failed to create a socket: %s", strerror(errno));
+		return false;
+	}
+
+	/* Set up the address to connect to */
+	memset(&remote, 0, sizeof(remote));
+	remote.sun_family = AF_UNIX;
+	snprintf(remote.sun_path, sizeof(remote.sun_path) - 1, "%s/external_hid_%04X_%04X",
+			EXTERNAL_HID_SOCKET_BASE, btd_device_get_vendor(idev->device), btd_device_get_product(idev->device));
+
+	/* Try to connect to a userspace application listening at that address */
+	if (connect(s, (struct sockaddr *) &remote, sizeof(struct sockaddr_un)) == -1) {
+		info("Not able to connect to %s, proceeding internally: %s",
+				remote.sun_path, strerror(errno));
+		close(s);
+		return false;
+	}
+	/* Get the address of the connected device */
+	ba2str(&idev->dst, dst_addr);
+	/* Prepare a control message to pass the interrupt port to the other application */
+	memset(&msg, 0, sizeof(msg));
+	/* Put the address of the peer in the message body */
+	iov.iov_base = dst_addr;
+	iov.iov_len = strlen(dst_addr);
+	/* Set the address of the message body in the message header, there will be only one */
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	/* Set up the Control data */
+	msg.msg_control = cmsgbuf;
+	msg.msg_controllen = sizeof(cmsgbuf);
+	/* Get the first control message header */
+	cmsg = CMSG_FIRSTHDR(&msg);
+	/* Type of the control message is SOL_SOCKET */
+	cmsg->cmsg_level = SOL_SOCKET;
+	/* SCM_RIGHTS is used to transfer open file descriptors over the unix socket */
+	cmsg->cmsg_type = SCM_RIGHTS;
+	/* The length of the control message header, including two File Descriptors of payload */
+	cmsg->cmsg_len = CMSG_LEN(sizeof(int) * 2);
+	/* Get the address of the data buffer */
+	fdptr = (int *) CMSG_DATA(cmsg);
+	/* Set the interrupt and control FD's in the array */
+	fdptr[0] = g_io_channel_unix_get_fd(idev->intr_io);
+	fdptr[1] = g_io_channel_unix_get_fd(idev->ctrl_io);
+	/* Set the actual message control length */
+	msg.msg_controllen = cmsg->cmsg_len;
+
+	/* Send the file descriptors to the other application */
+	if(sendmsg(s, &msg, 0) == -1) {
+		info("Message send failed: %s", strerror(errno));
+		close(s);
+		return false;
+	}
+
+	/* Create a input channel for the socket to the other application and use it as I/O */
+	idev->external_io = g_io_channel_unix_new(s);
+	/* Make the encoding NULL (raw data) */
+	if (g_io_channel_set_encoding(idev->external_io, NULL, NULL) != G_IO_STATUS_NORMAL) {
+		info("Failed to set binary encoding on the external io channel");
+	}
+	/* Turn off buffering */
+	g_io_channel_set_buffered(idev->external_io, FALSE);
+
+	/* Add a watch for it */
+	g_io_add_watch(idev->external_io, G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL, (GIOFunc) external_socket_event, idev);
+
+	/* Dealing with this connection is now up to the other application */
+	info("Device %s is handled by external application", dst_addr);
+
+	return true;
+}
+/* End patch */
 static int input_device_connected(struct input_device *idev)
 {
 	int err;
@@ -1032,6 +1165,12 @@ static int input_device_connected(struct input_device *idev)
 	if (idev->intr_io == NULL || idev->ctrl_io == NULL)
 		return -ENOTCONN;
 
+	/* Patch for sonyps3remote - check for an external (userland) handler first */
+	if (input_device_try_external(idev)) {
+		btd_service_connecting_complete(idev->service, 0);
+		return 0;
+	}
+	/* End patch */
 	err = hidp_add_connection(idev);
 	if (err < 0)
 		return err;
